@@ -747,10 +747,7 @@ def format_output(template, formatters, format_params):
     return template
 
 def probe_hits_wsum(region, probe_weights):
-    attrs_wsum = 0
-    for idx, hit in enumerate(region.probe_hits):
-        attrs_wsum += hit * probe_weights[idx]
-    return attrs_wsum
+    return region.probe_hits_wsum(probe_weights)
 
 def attrs_temperate_of(region, probe_weights, hits_age_sz_weights):
     attrs_wsum = probe_hits_wsum(region, probe_weights)

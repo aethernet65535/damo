@@ -364,5 +364,39 @@ class TestDamon(unittest.TestCase):
                 updated_targets, new_targets)
         self.assertEqual(result_targets, expect_targets)
 
+    def test_damon_prep_accepts_newer_kernel_action(self):
+        # A kernel may expose prep actions that damo does not know yet.
+        # Parsing must accept them instead of raising.
+        self.assertEqual(
+                _damon.DamonPrep(prep_action='perf_event').prep_action,
+                'perf_event')
+        self.assertEqual(
+                _damon.DamonPrep(prep_action='set_pgidle').prep_action,
+                'set_pgidle')
+
+    def test_damon_prep_roundtrip_preserves_unknown_action(self):
+        # damo re-stages the config it read.  An action it did not configure
+        # itself must survive the round trip, or the write-back would erase
+        # a probe the user set up by hand.
+        for action in ['set_pgidle', 'perf_event']:
+            prep = _damon.DamonPrep(prep_action=action)
+            kvpairs = prep.to_kvpairs()
+            self.assertEqual(kvpairs['prep_action'], action)
+            self.assertEqual(_damon.DamonPrep.from_kvpairs(kvpairs), prep)
+
+    def test_damon_region_probe_hits_wsum(self):
+        # When any probe weight is set, the kernel freezes nr_accesses at 0
+        # and the weighted probe hits sum is the region's access frequency.
+        # Missing weights or missing hits contribute nothing, like the
+        # kernel's damon_probe_hits_wsum() does.
+        region = _damon.DamonRegion(
+                '0', '4K', nr_accesses=0, nr_accesses_unit=_damon.unit_samples,
+                age=0, age_unit=_damon.unit_aggr_intervals, probe_hits=[3, 5])
+        self.assertEqual(region.probe_hits_wsum([2, 7]), 41)
+        self.assertEqual(region.probe_hits_wsum([2]), 6)
+        self.assertEqual(region.probe_hits_wsum([2, 7, 9]), 41)
+        self.assertEqual(region.probe_hits_wsum([]), 0)
+        self.assertEqual(region.probe_hits_wsum(None), 0)
+
 if __name__ == '__main__':
     unittest.main()

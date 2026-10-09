@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
 
+import os
+import tempfile
 import unittest
 
 import _test_damo_common
@@ -115,6 +117,123 @@ class TestDamonSysfs(unittest.TestCase):
         _damon_sysfs.write_kdamonds_dir('', kdamonds)
         logs = _damo_fs.debug_get_dryrun_logs()
         self.assertEqual(expected_dryrun_log, logs)
+
+    def test_probes_with_perf_event_prep_parsing(self):
+        # A kernel with the PMU sampling source exposes a 'perf_event' prep
+        # action plus perf_event_attr files alongside it.  Reading the running
+        # kdamond config must not blow up on it, and the unknown action must
+        # be kept verbatim so a later re-stage does not rewrite it.
+        probes_content = {
+                "nr_probes": "1\n",
+                "0": {
+                    "preps": {
+                        "nr_preps": "1\n",
+                        "0": {
+                            "prep_action": "perf_event\n",
+                            "type": "7\n",
+                            "config": "1\n",
+                            "config1": "0\n",
+                            "config2": "0\n",
+                            "sample_period": "100000\n",
+                            "sample_freq": "0\n",
+                            "wakeup_events": "1\n",
+                            "precise_ip": "0\n",
+                            "sample_phys_addr": "N\n",
+                            "sample_weight_struct": "N\n",
+                            "exclude_kernel": "N\n",
+                            "exclude_hv": "N\n",
+                            "freq": "N\n",
+                            "single_instance": "N\n",
+                            },
+                        },
+                    "filters": {"nr_filters": "0\n"},
+                    "weight": "0\n",
+                    },
+                }
+
+        probes = _damon_sysfs.files_content_to_probes(probes_content)
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(len(probes[0].preps), 1)
+        self.assertEqual(probes[0].preps[0].prep_action, 'perf_event')
+
+        # write-back: keep the action verbatim, and do not rewrite
+        # nr_probes/nr_preps since the counts are unchanged -- rewriting them
+        # would rebuild the probe and drop its perf_event_attr settings.
+        probe_root = os.path.join(tempfile.mkdtemp(), 'probes')
+        preps_dir = os.path.join(probe_root, '0', 'preps')
+        os.makedirs(preps_dir)
+        with open(os.path.join(probe_root, '0', 'weight'), 'w') as f:
+            f.write('0\n')
+
+        nr_probes = os.path.join(probe_root, 'nr_probes')
+        nr_preps = os.path.join(preps_dir, 'nr_preps')
+        nr_filters = os.path.join(probe_root, '0', 'filters', 'nr_filters')
+        _damo_fs.debug_dryrun({
+            nr_probes: '1\n',
+            nr_preps: '1\n',
+            nr_filters: '0\n',
+            })
+        err = _damon_sysfs.write_probes_dir(probe_root, probes)
+        self.assertIsNone(err)
+        self.assertEqual(_damo_fs.debug_get_dryrun_logs(), [
+            "read '%s': '1'" % nr_probes,
+            "read '%s': '1'" % nr_preps,
+            "write 'perf_event' to '%s'" % os.path.join(preps_dir, '0',
+                'prep_action'),
+            "read '%s': '0'" % nr_filters,
+            "write '0' to '%s'" % os.path.join(probe_root, '0', 'weight'),
+            ])
+
+    def test_kdamonds_read_with_perf_event_probe(self):
+        # Reproduces the reported crash end to end: reading a kdamond config
+        # whose probe carries a 'perf_event' prep action.
+        sysfs_dict = {
+                "nr_kdamonds": "1\n",
+                "0": {
+                    "state": "on\n",
+                    "pid": "1234\n",
+                    "refresh_ms": "0\n",
+                    "contexts": {
+                        "nr_contexts": "1\n",
+                        "0": {
+                            "operations": "vaddr\n",
+                            "monitoring_attrs": {
+                                "intervals": {
+                                    "sample_us": "5000\n",
+                                    "aggr_us": "100000\n",
+                                    "update_us": "1000000\n",
+                                    },
+                                "nr_regions": {"min": "10\n", "max": "1000\n"},
+                                "probes": {
+                                    "nr_probes": "1\n",
+                                    "0": {
+                                        "preps": {
+                                            "nr_preps": "1\n",
+                                            "0": {
+                                                "prep_action":
+                                                "perf_event\n",
+                                                "type": "7\n",
+                                                "config": "1\n",
+                                                "sample_period": "100000\n",
+                                                },
+                                            },
+                                        "filters": {"nr_filters": "0\n"},
+                                        "weight": "0\n",
+                                        },
+                                    },
+                                },
+                            "targets": {"nr_targets": "0\n"},
+                            "schemes": {"nr_schemes": "0\n"},
+                            },
+                        },
+                    },
+                }
+
+        kdamonds = _damon_sysfs.files_content_to_kdamonds(sysfs_dict)
+        self.assertEqual(len(kdamonds), 1)
+        probes = kdamonds[0].contexts[0].probes
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0].preps[0].prep_action, 'perf_event')
 
 if __name__ == '__main__':
     unittest.main()

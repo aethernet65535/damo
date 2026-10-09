@@ -252,6 +252,13 @@ region_formatters = [
             ' '.join(['%d' % h for h in region.probe_hits]),
             'data attributese probe hit counts'),
         Formatter(
+            '<probe hits wsum>',
+            lambda index, region, snapshot, record, fmt:
+            _damo_fmt_str.format_nr(
+                region.probe_hits_wsum(probe_weights_for(fmt, record)),
+                fmt.raw_number),
+            'probe hit counts of the region, weighted by the probe weights'),
+        Formatter(
             '<filters passed bytes>',
             lambda index, region, snapshot, record, fmt:
             _damo_fmt_str.format_sz(region.sz_filter_passed, fmt.raw_number)
@@ -260,7 +267,8 @@ region_formatters = [
         Formatter(
             '<box>',
             lambda index, region, snapshot, record, fmt:
-            fmt.region_box_format.to_str(region),
+            fmt.region_box_format.to_str(
+                region, probe_weights_for(fmt, record)),
             'user-customizable (via --region_box_*) box ' \
                     '(age/access_rate/size by default)'),
         ]
@@ -875,13 +883,16 @@ class SortedAccessPatterns:
     sz_regions = None
     access_rates_percent = None
     ages_us = None
+    probe_hits_wsums = None
 
-    def __init__(self, records):
+    def __init__(self, records, probe_weights_of=None):
         self.sz_regions = []
         self.access_rates_percent = []
         self.ages_us = []
+        self.probe_hits_wsums = []
 
         for record in records:
+            probe_weights = probe_weights_of_record(probe_weights_of, record)
             for snapshot in record.snapshots:
                 for region in snapshot.regions:
                     self.sz_regions.append(region.size())
@@ -892,9 +903,15 @@ class SortedAccessPatterns:
 
                     region.age.add_unset_unit(record.intervals)
                     self.ages_us.append(region.age.usec)
+
+                    # Unknown probe weights score no hit, which is the same
+                    # all-zero state nr_accesses is in then.
+                    self.probe_hits_wsums.append(
+                            region.probe_hits_wsum(probe_weights))
         self.sz_regions.sort()
         self.access_rates_percent.sort()
         self.ages_us.sort()
+        self.probe_hits_wsums.sort()
 
 class RegionBoxAttr:
     value_name = None
@@ -930,9 +947,11 @@ class RegionBoxFormat:
             sorted_vals = self.sorted_access_patterns.access_rates_percent
         elif value_name == 'age':
             sorted_vals = self.sorted_access_patterns.ages_us
+        elif value_name == 'probe_hits_wsum':
+            sorted_vals = self.sorted_access_patterns.probe_hits_wsums
         return sorted_vals[0], sorted_vals[-1]
 
-    def val_minmax(self, region, value_name):
+    def val_minmax(self, region, value_name, probe_weights=None):
         minval, maxval = self.minmax(value_name)
         if value_name == 'size':
             return region.size(), [minval, maxval]
@@ -940,17 +959,19 @@ class RegionBoxFormat:
             return region.nr_accesses.percent, [minval, maxval]
         elif value_name == 'age':
             return region.age.usec, [minval, maxval]
+        elif value_name == 'probe_hits_wsum':
+            return region.probe_hits_wsum(probe_weights), [minval, maxval]
         return None, None
 
-    def to_str(self, region):
+    def to_str(self, region, probe_weights=None):
         length_val, length_val_minmax = self.val_minmax(region,
-                self.length.value_name)
+                self.length.value_name, probe_weights)
         color_val, color_val_minmax = self.val_minmax(region,
-                self.color.value_name)
+                self.color.value_name, probe_weights)
         if color_val == None:
             color_val = '-'
         height_val, height_val_minmax = self.val_minmax(region,
-                self.height.value_name)
+                self.height.value_name, probe_weights)
 
         box = '%s' % ColoredBox(
                 BoxValue(length_val, length_val_minmax,
@@ -973,6 +994,9 @@ class RegionBoxFormat:
         if value_name == 'access_rate':
             return '[%s, %s]' % (_damo_fmt_str.format_percent(minval, raw),
                     _damo_fmt_str.format_percent(maxval, raw))
+        if value_name == 'probe_hits_wsum':
+            return '[%s, %s]' % (_damo_fmt_str.format_nr(minval, raw),
+                    _damo_fmt_str.format_nr(maxval, raw))
 
     def description_msg(self, raw):
         lines = []
@@ -1055,7 +1079,87 @@ def temperature_of(region, weights):
     else:
         return -1 * score
 
-def sorted_regions(regions, sort_fields, sort_dsc_keys, temperature_weights):
+def probe_weights_of_records(records, kdamonds):
+    '''
+    Returns {(kdamond idx, context idx): [probe weights]} of the given
+    records, or None if the kdamonds that generated them are unknown.
+
+    Probe weights tell which access frequency metric the kernel used: if any
+    of them is nonzero, the kernel keeps nr_accesses at zero and scores regions
+    by probe hits instead.
+    '''
+    if kdamonds is None:
+        return None
+    weights_of = {}
+    for record in records:
+        try:
+            if record.kdamond_idx < 0 or record.context_idx < 0:
+                # Records of the damon_stat data source have no kdamond of
+                # their own.  Negative indices would wrap around to the last
+                # kdamond, attributing its weights to this record.
+                continue
+            ctx = kdamonds[record.kdamond_idx].contexts[record.context_idx]
+            probes = ctx.probes if ctx.probes else []
+        except (IndexError, TypeError, AttributeError):
+            # A record referring to a kdamond/context that we could not read.
+            # Skip it; it falls back to the nr_accesses-based behavior.
+            continue
+        weights_of[(record.kdamond_idx, record.context_idx)] = [
+                probe.weight for probe in probes]
+    return weights_of
+
+def probe_weights_of_input(input_file, records):
+    '''
+    Returns {(kdamond idx, context idx): [probe weights]} that the given
+    --input generated the records with, or None if they are unknown.
+
+    A live input uses the currently set up kdamonds, while a recorded one uses
+    its '<file>.kdamonds' sidecar.  Records of multiple record files are merged
+    without telling which file each of them came from, and the kdamond indices
+    of each file restart at zero, so their weights cannot be attributed to
+    them; unknown is then reported to fall back to nr_accesses.
+    '''
+    if input_file and type(input_file) is list and len(input_file) > 1:
+        return None
+    kdamonds, _ = _damo_records.kdamonds_for(input_file)
+    return probe_weights_of_records(records, kdamonds)
+
+def probe_weights_of_record(probe_weights_of, record):
+    '''
+    Probe weights of the given record's context, or [] if the weights are
+    unknown.
+    '''
+    if not probe_weights_of:
+        return []
+    return probe_weights_of.get(
+            (record.kdamond_idx, record.context_idx), [])
+
+def probe_weights_for(fmt, record):
+    return probe_weights_of_record(fmt.probe_weights_of, record)
+
+def has_probe_weights(probe_weights):
+    '''
+    Whether any probe of the context has a nonzero weight, in which case the
+    kernel scores regions by probe hits instead of nr_accesses.
+    '''
+    return any(weight > 0 for weight in probe_weights)
+
+def uses_probe_hits(fmt, record):
+    '''
+    Whether the kernel scored the given record's regions by probe hits, which
+    is the case while any probe of the record's context has a nonzero weight.
+    '''
+    return has_probe_weights(probe_weights_for(fmt, record))
+
+def any_uses_probe_hits(fmt, records):
+    '''
+    Whether any of the given records was scored by probe hits rather than by
+    nr_accesses.
+    '''
+    return any([uses_probe_hits(fmt, record) for record in records])
+
+def sorted_regions(regions, sort_fields, sort_dsc_keys, temperature_weights,
+        probe_weights=None):
     for field in sort_fields:
         dsc = sort_dsc_keys != None and ('all' in sort_dsc_keys or
                                          field in sort_dsc_keys)
@@ -1072,10 +1176,15 @@ def sorted_regions(regions, sort_fields, sort_dsc_keys, temperature_weights):
             regions = sorted(
                     regions, reverse=dsc,
                     key=lambda r: temperature_of(r, temperature_weights))
+        elif field == 'probe_hits_wsum':
+            regions = sorted(
+                    regions, reverse=dsc,
+                    key=lambda r: r.probe_hits_wsum(probe_weights))
     return regions
 
 def fmt_records(fmt, records):
-    sorted_access_patterns = SortedAccessPatterns(records)
+    sorted_access_patterns = SortedAccessPatterns(
+            records, fmt.probe_weights_of)
     fmt.region_box_format = RegionBoxFormat(sorted_access_patterns,
             RegionBoxAttr(fmt.region_box_values[0],
                 fmt.region_box_min_max_length,
@@ -1104,7 +1213,8 @@ def fmt_records(fmt, records):
                 r.age.add_unset_unit(record.intervals)
             for idx, r in enumerate(
                     sorted_regions(snapshot.regions, fmt.sort_regions_by,
-                        fmt.sort_regions_dsc, fmt.temperature_weights)):
+                        fmt.sort_regions_dsc, fmt.temperature_weights,
+                        probe_weights_for(fmt, record))):
                 outputs.append(
                         format_output(
                             fmt.format_region, region_formatters,
@@ -1122,12 +1232,26 @@ def fmt_records(fmt, records):
     outputs = [o for o in outputs if o is not None]
     return '\n'.join(outputs)
 
-def pr_records_raw_form(records, raw_number):
+def pr_records_raw_form(records, raw_number, probe_weights_of=None):
     lines = []
     for record in records:
         snapshots = record.snapshots
         if len(snapshots) == 0:
             continue
+
+        # While any probe of the record's context has a weight, the kernel
+        # keeps nr_accesses at zero, so the weighted probe hits show the
+        # access frequency instead.
+        probe_weights = probe_weights_of_record(probe_weights_of, record)
+        use_probe_hits_wsum = has_probe_weights(probe_weights)
+        if use_probe_hits_wsum:
+            access_col_label = 'probe_hits_wsum'
+            header_fmt = '# %10s %12s  %12s  %15s %5s'
+            region_fmt = '%012x-%012x (%12s) %15d %5d'
+        else:
+            access_col_label = 'nr_accesses'
+            header_fmt = '# %10s %12s  %12s  %11s %5s'
+            region_fmt = '%012x-%012x (%12s) %11d %5d'
 
         base_time = snapshots[0].start_time
         lines.append('base_time_absolute: %s' %
@@ -1147,13 +1271,18 @@ def pr_records_raw_form(records, raw_number):
                         raw_number))
             lines.append('target_id: %s' % record.target_id)
             lines.append('nr_regions: %s' % len(snapshot.regions))
-            lines.append('# %10s %12s  %12s  %11s %5s' %
-                    ('start_addr', 'end_addr', 'length', 'nr_accesses', 'age'))
+            lines.append(header_fmt %
+                    ('start_addr', 'end_addr', 'length', access_col_label,
+                        'age'))
             for r in snapshot.regions:
-                lines.append("%012x-%012x (%12s) %11d %5d" %
+                if use_probe_hits_wsum:
+                    access_nr = r.probe_hits_wsum(probe_weights)
+                else:
+                    access_nr = r.nr_accesses.samples
+                lines.append(region_fmt %
                         (r.start, r.end,
                             _damo_fmt_str.format_sz(r.size(), raw_number),
-                            r.nr_accesses.samples, r.age.aggr_intervals
+                            access_nr, r.age.aggr_intervals
                                 if r.age.aggr_intervals != None else -1))
             lines.append('')
     lines.append('')
@@ -1165,7 +1294,7 @@ def pr_records(fmt, records, dont_use_pager):
                 json.dumps([r.to_kvpairs(fmt.raw_number) for r in records],
                            indent=4))
     elif fmt.raw:
-        pr_records_raw_form(records, fmt.raw_number)
+        pr_records_raw_form(records, fmt.raw_number, fmt.probe_weights_of)
     else:
         to_show = fmt_records(fmt, records)
         if dont_use_pager:
@@ -1178,6 +1307,10 @@ class ReportFormat:
     sort_regions_dsc = None
     temperature_weights = None
     dont_merge_regions = None
+
+    # {(kdamond idx, context idx): [probe weights]}.  Set on set_formats() from
+    # the kdamonds that the records were generated with, or None if unknown.
+    probe_weights_of = None
 
     hist_logscale = None
     hist_cumulate = None
@@ -1313,9 +1446,10 @@ class ReportFormat:
             self.snapshot_heatmap_width = 80
         # snapshot_heatmap_colorset introduced from v2.5.6
         if 'snapshot_heatmap_colorset' in kvpairs:
-            self.snapshot_heatmap_width = kvpairs['snapshot_heatmap_width']
+            self.snapshot_heatmap_colorset = \
+                    kvpairs['snapshot_heatmap_colorset']
         else:
-            self.snapshot_heatmap_width = 'gray'
+            self.snapshot_heatmap_colorset = 'gray'
         # snapshot_heatmap_static introduced after v2.6.7
         if 'snapshot_heatmap_static' in kvpairs:
             self.snapshot_heatmap_static = kvpairs['snapshot_heatmap_static']
@@ -1432,15 +1566,34 @@ def set_formats_handle_format_set_arg(fmt, format_arg):
             fmt.format_record_tail = fmt_string
     return fmt, None
 
+def set_formats_handle_box_values(fmt, records):
+    '''
+    Make the <box> show values that carry data.  access_rate comes from
+    nr_accesses, which the kernel keeps at zero while any probe of the context
+    has a weight, so the box then needs the weighted probe hits instead.
+    '''
+    if not any_uses_probe_hits(fmt, records):
+        return
+    fmt.region_box_values = [
+            'probe_hits_wsum' if value == 'access_rate' else value
+            for value in fmt.region_box_values]
+
 def set_formats_handle_styles(fmt, args, records):
     if args.style is None:
         return
+
+    # While any probe has a weight, the kernel keeps nr_accesses at zero, so an
+    # <access hz> column would be all zeros.  Show the weighted probe hits
+    # instead, which is the access frequency then.
+    access_keyword = '<access hz>'
+    if any_uses_probe_hits(fmt, records):
+        access_keyword = '<probe hits wsum>'
 
     if args.style == 'simple-boxes':
         fmt.format_snapshot_head = \
                 'snapshot time: [<start time>, <end time>] (<duration>)'
         fmt.format_region = \
-                '<box> size <size> access <access hz> age <age>'
+                '<box> size <size> access %s age <age>' % access_keyword
         fmt.region_box_min_max_height = [1, 1]
         fmt.region_box_min_max_length = [1, 40]
         fmt.region_box_align = 'right'
@@ -1453,14 +1606,14 @@ def set_formats_handle_styles(fmt, args, records):
     elif args.style == 'temperature-percentiles':
         set_formats_percentiles(args, fmt, records, 'temperature')
     elif args.style == 'cold':
-        fmt.format_region = '<box> <size> access <access hz> <age>'
+        fmt.format_region = '<box> <size> access %s <age>' % access_keyword
         fmt.region_box_min_max_height = [1, 1]
         fmt.region_box_min_max_length = [1, 40]
         fmt.region_box_align = 'right'
         fmt.region_box_colorset = 'emotion'
         fmt.sort_regions_by = ['temperature']
     elif args.style == 'hot':
-        fmt.format_region = '<box> <size> access <access hz> <age>'
+        fmt.format_region = '<box> <size> access %s <age>' % access_keyword
         fmt.region_box_min_max_height = [1, 1]
         fmt.region_box_min_max_length = [1, 40]
         fmt.region_box_align = 'right'
@@ -1505,7 +1658,8 @@ def get_min_chars_for(name, min_chars_list):
         if n == name:
             return val
 
-def probe_legend_lines(min_chars_for):
+def probe_legend_lines(min_chars_for, access_keyword='<access hz>',
+        access_label='access_hz'):
     lines =[]
     words = ['#']
     words.append(' ' * (get_min_chars_for('<index>', min_chars_for)))
@@ -1515,7 +1669,7 @@ def probe_legend_lines(min_chars_for):
     words.append('size')
     words.append(' ' * (get_min_chars_for('<size>', min_chars_for) -
                  len('size') + 2))
-    words.append(' ' * (get_min_chars_for('<access hz>', min_chars_for) + 1))
+    words.append(' ' * (get_min_chars_for(access_keyword, min_chars_for) + 1))
     words.append('age')
     words.append(' ' * (get_min_chars_for('<age>', min_chars_for) - len('age') + 1))
     words.append('probe_hits')
@@ -1527,7 +1681,7 @@ def probe_legend_lines(min_chars_for):
                     get_min_chars_for('<index>', min_chars_for) + 1 +
                     get_min_chars_for('<start address>', min_chars_for) + 1 +
                     get_min_chars_for('<size>', min_chars_for) + 1),
-                'access_hz']))
+                access_label]))
     return lines
 
 def set_fmt_snapshot_head_default(
@@ -1548,7 +1702,11 @@ def set_fmt_snapshot_head_default(
         lines.append('# damos filters (df): <filters passed type>')
         lines.append('df-pass: <filters passed heatmap>')
     if has_probes and fmt.format_region is None:
-        lines += probe_legend_lines(fmt.min_chars_for)
+        if any_uses_probe_hits(fmt, records):
+            lines += probe_legend_lines(
+                    fmt.min_chars_for, '<probe hits wsum>', 'hits_wsum')
+        else:
+            lines += probe_legend_lines(fmt.min_chars_for)
     fmt.format_snapshot_head = '\n'.join(lines)
 
 def set_fmt_snapshot_tail_default(fmt, records, args, ops_filters_installed):
@@ -1585,6 +1743,13 @@ def set_formats_snapshot_default(
 def set_formats_region_probe_hits_default(fmt, records, args):
     default_region_format = \
             '<index> <start address> <size>  <access hz> <age> <probe hits> '
+    if any_uses_probe_hits(fmt, records):
+        # While any probe has a weight, the kernel keeps nr_accesses at zero,
+        # so an <access hz> column would be all zeros.  Show the weighted probe
+        # hits instead, which is the access frequency then.
+        default_region_format = \
+                '<index> <start address> <size>  <probe hits wsum> ' \
+                '<age> <probe hits> '
     if args.region_box:
         if fmt.region_box_min_max_height[1] > 1:
             fmt.format_region = '<box>%s' % default_region_format
@@ -1643,6 +1808,10 @@ def set_formats_update_default_formats(fmt, records, args):
 def set_formats_handle_format_append_arg(fmt, format_args):
     if format_args is None:
         return
+    if len(format_args) == 1 and len(format_args[0]) == 1:
+        # The json/file form of --format sets the whole format at once and has
+        # no append entries.
+        return
     for action, target_area, fmt_string in format_args:
         if action != 'append':
             continue
@@ -1657,7 +1826,7 @@ def set_formats_handle_format_append_arg(fmt, format_args):
         elif target_area == 'record_tail':
             fmt.format_record_tail += fmt_string
 
-def set_formats(args, records):
+def set_formats(args, records, probe_weights_of=None):
     # Setup basic formats as user specified, including
     # --format_{record_head,record_tail,snapshot_head,snapshot_tail,region}
     # options.  --format is not yet applied.
@@ -1666,6 +1835,10 @@ def set_formats(args, records):
     fmt, err = set_formats_handle_format_set_arg(fmt, args.format)
     if err is not None:
         return fmt, err
+    # After the --format handling above: its json/file form replaces the whole
+    # fmt, which would otherwise lose the probe weights.
+    fmt.probe_weights_of = probe_weights_of
+    set_formats_handle_box_values(fmt, records)
     set_formats_handle_styles(fmt, args, records)
 
     if args.total_sz_only:
@@ -1676,6 +1849,16 @@ def set_formats(args, records):
     set_formats_update_default_formats(fmt, records, args)
     set_formats_handle_format_append_arg(fmt, args.format)
     return fmt, None
+
+def set_formats_for_input(args, records):
+    '''
+    Returns the formats for the records read from args.input.  The probe
+    weights that the input generated the records with decide whether
+    nr_accesses or the weighted probe hits show the access frequency; unknown
+    weights silently fall back to the nr_accesses-based behavior.
+    '''
+    return set_formats(args, records,
+            probe_weights_of_input(args.input_file, records))
 
 def handle_ls_keywords(args):
     if args.ls_record_format_keywords:
@@ -1882,7 +2065,7 @@ def read_and_show(args):
                 print('some records lack the intervals information')
                 exit(1)
 
-        fmt, err = set_formats(args, records)
+        fmt, err = set_formats_for_input(args, records)
         if err is not None:
             print('format setting failed (%s)' % err)
             exit(1)
@@ -1934,13 +2117,14 @@ def add_fmt_args(parser, hide_help=False):
             'If >3 argumenta are given, show percentiles of each argument.')
     parser.add_argument(
             '--sort_regions_by', nargs='+',
-            choices=['address', 'access_rate', 'age', 'size', 'temperature'],
+            choices=['address', 'access_rate', 'age', 'size', 'temperature',
+                     'probe_hits_wsum'],
             default=['address'],
             help='fields to sort regions by'
             if not hide_help else argparse.SUPPRESS)
     parser.add_argument('--sort_regions_dsc',
             choices=['address', 'access_rate', 'age', 'size', 'temperature',
-                     'all'],
+                     'probe_hits_wsum', 'all'],
             nargs='+',
             help='sort regions in descending order for the given keys'
             if not hide_help else argparse.SUPPRESS)
@@ -2015,7 +2199,8 @@ def add_fmt_args(parser, hide_help=False):
             if not hide_help else argparse.SUPPRESS)
     parser.add_argument(
             '--region_box_values',
-            choices=['size', 'access_rate', 'age', 'none'], nargs=3,
+            choices=['size', 'access_rate', 'age', 'probe_hits_wsum',
+                     'none'], nargs=3,
             default=['age', 'access_rate', 'size'],
             help='values to show via the <box>\'s length, color, and height'
             if not hide_help else argparse.SUPPRESS)
@@ -2052,6 +2237,7 @@ def add_fmt_args(parser, hide_help=False):
                      ['<start address>', 12],['<end address>', 11],
                      ['<size>', 11], ['<access rate>', 5],
                      ['<access hz>', 6],
+                     ['<probe hits wsum>', 6],
                      ['<age>', 13],
                      ['<filters passed type>', 10],
                      ],

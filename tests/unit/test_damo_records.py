@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
 
+import json
+import os
+import tempfile
 import unittest
 
 import _test_damo_common
@@ -237,6 +240,45 @@ class TestDamon(unittest.TestCase):
                 'damon:damon_aggregated: target_id=12 nr_regions=10 '
                 '7473692672-8372879360: 3')),
             (False, None))
+
+    def test_kdamonds_for_record_file(self):
+        # Recorded snapshots keep their kdamonds in a '<file>.kdamonds'
+        # sidecar, which is where probe weights come from.
+        kdamond = _damon.Kdamond('on', 1234, [
+            _damon.DamonCtx(probes=[
+                _damon.DamonProbe(filters=[], weight=3),
+                _damon.DamonProbe(filters=[], weight=5)])])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            record_file = os.path.join(tmpdir, 'damon.data')
+            with open(record_file + '.kdamonds', 'w') as f:
+                json.dump([kdamond.to_kvpairs()], f)
+
+            kdamonds, err = _damo_records.kdamonds_for([record_file])
+            self.assertIsNone(err)
+            self.assertEqual(len(kdamonds), 1)
+            self.assertEqual(
+                    [p.weight for p in kdamonds[0].contexts[0].probes],
+                    [3, 5])
+
+            # A missing sidecar means 'probe weights unknown'.  It must be
+            # reported as an error, not raised as an exception, so callers can
+            # fall back to the nr_accesses-based behavior.
+            kdamonds, err = _damo_records.kdamonds_for(
+                    [os.path.join(tmpdir, 'nope.data')])
+            self.assertIsNone(kdamonds)
+            self.assertIsNotNone(err)
+
+    def test_kdamonds_for_live(self):
+        # Live snapshots read the kdamonds from the running DAMON state.
+        expect = [_damon.Kdamond('on', 1234, [_damon.DamonCtx()])]
+        orig = _damon.current_kdamonds
+        _damon.current_kdamonds = lambda: expect
+        try:
+            kdamonds, err = _damo_records.kdamonds_for(None)
+            self.assertIsNone(err)
+            self.assertEqual(kdamonds, expect)
+        finally:
+            _damon.current_kdamonds = orig
 
 if __name__ == '__main__':
     unittest.main()

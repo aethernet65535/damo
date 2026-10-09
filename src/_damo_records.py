@@ -1996,6 +1996,38 @@ def get_records(tried_regions_of=None, record_file=None,
     filter_copy.filter_records(records)
     return records, None
 
+def kdamonds_for(record_files):
+    '''
+    Returns list of _damon.Kdamond objects that the given record files were
+    generated with, and err.
+
+    Live records (no record file) use the currently set up kdamonds, while
+    recorded ones use the '<record file>.kdamonds' sidecar of each record
+    file.  Returns None and err if any of them cannot be read, so that callers
+    can fall back to the kdamonds-unaware behavior.
+    '''
+    if not record_files:
+        try:
+            return _damon.current_kdamonds(), None
+        except Exception as e:
+            return None, 'reading current kdamonds failed (%s)' % e
+
+    if type(record_files) is not list:
+        record_files = [record_files]
+
+    kdamonds = []
+    for record_file in record_files:
+        kdamonds_file = '%s.kdamonds' % record_file
+        if not os.path.isfile(kdamonds_file):
+            return None, '%s file not found' % kdamonds_file
+        try:
+            with open(kdamonds_file, 'r') as f:
+                kvpairs = json.load(f)
+            kdamonds += [_damon.Kdamond.from_kvpairs(kvp) for kvp in kvpairs]
+        except Exception as e:
+            return None, 'parsing %s failed (%s)' % (kdamonds_file, e)
+    return kdamonds, None
+
 def get_damo_records(
         tried_regions_of=None, record_files=None, snapshot_damos_filters=None,
         record_filter=None, total_sz_only=False, dont_merge_regions=True):
@@ -2013,19 +2045,18 @@ def get_damo_records(
         if err is not None:
             return None, err
 
-        kdamonds = _damon.current_kdamonds()
+        kdamonds, err = kdamonds_for(record_files)
+        if err is not None:
+            return None, err
         damon_records = DamonRecords(
                 kdamonds=kdamonds, record_list=damon_records_list)
         return [DamoRecord(damon_records=damon_records)], None
 
     damo_records = []
     for record_file in record_files:
-        kdamonds_file = '%s.kdamonds' % record_file
-        if not os.path.isfile(kdamonds_file):
-            return None, '%s file not found' % kdamonds_file
-        with open(kdamonds_file, 'r') as f:
-            kvpairs = json.load(f)
-        kdamonds = [_damon.Kdamond.from_kvpairs(kvp) for kvp in kvpairs]
+        kdamonds, err = kdamonds_for([record_file])
+        if err is not None:
+            return None, err
 
         damon_records_list, err = get_records(
                 tried_regions_of, [record_file], snapshot_damos_filters,

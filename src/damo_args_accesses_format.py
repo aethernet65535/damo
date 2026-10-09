@@ -9,7 +9,10 @@ def main(args):
     handled = damo_report_access.handle_ls_keywords(args)
     if handled:
         return
-    fmt = damo_report_access.set_formats(args, records=[])
+    fmt, err = damo_report_access.set_formats(args, records=[])
+    if err is not None:
+        print('format setting failed (%s)' % err)
+        exit(1)
     kvpairs = fmt.to_kvpairs(raw=args.raw)
 
     if args.output_format == 'json':

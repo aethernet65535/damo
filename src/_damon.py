@@ -17,17 +17,15 @@ import _damo_fmt_str
 
 prep_action_set_pgidle = 'set_pgidle'
 
-prep_actions = [
-        prep_action_set_pgidle,
-        ]
-
 class DamonPrep:
     prep_action = None
 
     def __init__(self, prep_action=prep_action_set_pgidle):
-        if not prep_action in prep_actions:
-            raise Exception('wrong prep action (%s)' % prep_action)
-
+        # The kernel is the authority on valid prep actions.  It may expose
+        # actions this damo does not know yet (e.g. 'perf_event' for the PMU
+        # sampling source), so keep the value verbatim instead of failing --
+        # refusing here would make damo unable to read a running kdamond, and
+        # a re-stage would otherwise rewrite an action the user set by hand.
         self.prep_action = prep_action
 
     def to_str(self, raw):
@@ -718,6 +716,19 @@ class DamonRegion:
 
     def size(self):
         return self.end - self.start
+
+    def probe_hits_wsum(self, probe_weights):
+        '''Weighted sum of this region's probe hits.
+
+        While any probe weight is set, the kernel stops updating nr_accesses
+        and scores regions by probe hits instead, so this is then the region's
+        access frequency.  Probes without a weight, and weights without hits,
+        contribute nothing, matching the kernel's damon_probe_hits_wsum().
+        '''
+        if not self.probe_hits or not probe_weights:
+            return 0
+        return sum(hit * weight
+                for hit, weight in zip(self.probe_hits, probe_weights))
 
 class DamonTarget:
     pid = None

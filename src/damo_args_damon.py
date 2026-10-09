@@ -10,7 +10,14 @@ import damo_report_damon
 def main(args):
     _damon.ensure_root_permission()
 
-    kdamonds, err = _damon_args.kdamonds_for(args)
+    if args.from_current:
+        # Reading the current setup doesn't need sysinfo.
+        _damon.ensure_initialized(args, load_sysinfo=False)
+        kdamonds = _damon.current_kdamonds()
+        err = None
+    else:
+        kdamonds, err = _damon_args.kdamonds_for(args)
+
     if err:
         print('invalid arguments (%s)' % err)
         exit(1)
@@ -76,6 +83,10 @@ def set_argparser(parser):
     parser.description = ' '.join([
         'format DAMON parameters'])
     parser.add_argument(
+            '--from_current', action='store_true',
+            help='use the current DAMON setup as the source, instead of the '
+                 'command line options')
+    parser.add_argument(
             '--format', choices=['json', 'yaml', 'report'], default='json',
             help='format of the output')
     parser.add_argument(
@@ -94,3 +105,4 @@ def set_argparser(parser):
             '--out', metavar='<file>', help='save the output to the given file')
     parser.add_argument( '--omit_defaults', action='store_true',
                         help='omit default parameters')
+    _damon_args.add_interface_debug_args(parser)
